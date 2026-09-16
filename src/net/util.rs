@@ -231,16 +231,11 @@ impl SendLoop {
             tokio::select! {
                 biased;
                 _ = &mut closed => break,
-                // Break when the send channel is closed (all senders dropped),
-                // i.e. this connection was superseded or the peer disconnected.
-                // A previous `Some(msg) = recv()` arm plus `else => break` never
-                // broke on channel closure: the `closed` branch above stays
-                // enabled-and-pending, so `else` (which only runs when *every*
-                // branch is disabled) never fired, and the send loop blocked on
-                // `closed` forever. That left the superseded connection's
-                // `connection_loop` running indefinitely — the connection (and its
-                // backing transport state) was never closed or reclaimed, leaking
-                // one connection per churned link under active-view churn.
+                // Match on `None` instead of `Some(msg) = recv()` plus `else =>
+                // break`: that `else` runs only when every branch is disabled, and
+                // the biased `closed` branch stays enabled-and-pending, so a closed
+                // channel never broke the loop and the connection was never
+                // reclaimed.
                 msg = self.send_rx.recv() => match msg {
                     Some(msg) => self.write_message(&msg).await?,
                     None => break,
