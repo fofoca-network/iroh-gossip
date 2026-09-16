@@ -581,19 +581,11 @@ impl Actor {
         {
             if conn.stable_id() == *active_conn_id {
                 debug!("active send connection closed, mark peer as disconnected");
-                // fofoca patch (pre-handshake wedge): drop the peer entry here
-                // rather than waiting for the proto to emit `DisconnectPeer`.
-                // A connection that died before the gossip handshake never
-                // became a proto neighbor, so the proto has nothing to
-                // disconnect and never emits it — and the dead `Active` entry
-                // then swallowed every later send to that peer ("failed to
-                // send: connection task send loop terminated", forever)
-                // instead of letting the next send re-dial. Observed against
-                // an accept gate that holds and then refuses relay-only
-                // connections. The entry's sender died with the connection
-                // and `other_conns` senders were already dropped on
-                // replacement, so nothing usable is discarded; their tasks
-                // land in the "already marked as disconnected" branch.
+                // Remove the entry here rather than wait for `DisconnectPeer`:
+                // a connection that dies before the gossip handshake never made
+                // the peer a proto neighbor, so the proto never asks to
+                // disconnect it, and the dead sender swallows every later send
+                // instead of letting the next one re-dial.
                 self.peers.remove(&peer_id);
                 self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
                     .await;
@@ -707,13 +699,11 @@ impl Actor {
                             }
                         }
                         PeerState::Pending { queue } => {
-                            // Dial on every send, not only when the queue is empty. A
-                            // failed dial leaves the queue non-empty, which used to mean
-                            // no later send ever dialed again. `Dialer::queue_dial`
-                            // already returns early while a dial for this peer is in
-                            // flight, so it is the correct guard; the queue is not. And
-                            // keeping the entry keeps the queue, so an inbound connection
-                            // can still flush it via `accept_conn`.
+                            // Dial on every send, not only on an empty queue: a failed
+                            // dial leaves the queue non-empty, which used to stop every
+                            // later send from dialing. `Dialer::queue_dial` already
+                            // returns early while a dial is in flight, so it is the
+                            // guard here, not the queue.
                             if !self.dialer.is_pending(peer_id) {
                                 debug!(peer = %peer_id.fmt_short(), "start to dial");
                             }
@@ -915,18 +905,11 @@ async fn connection_loop(
     let send_fut = send_loop.run(queue).instrument(error_span!("send"));
     let recv_fut = recv_loop.run().instrument(error_span!("recv"));
 
-    // Exit as soon as *either* half finishes, rather than waiting for both.
-    // When this connection is superseded by a newer one to the same peer
-    // (`PeerState::accept_conn` drops its `send_tx`), the send loop ends but the
-    // recv loop would otherwise run forever — the peer keeps the connection
-    // alive via keep-alives, so it never idle-times-out and is never closed.
-    // That leaks the whole connection (its driver + transport state) once per
-    // churned connection. Finishing here lets the spawned task complete →
-    // `handle_connection_task_finished` closes the connection → it drains and is
-    // reclaimed. For the *active* connection the send loop never ends (its
-    // sender is held in `PeerState`), so this still exits only when the recv
-    // loop does (peer-initiated close) — unchanged. The dropped future is
-    // cancelled, which is fine: the connection is being torn down regardless.
+    // `select!`, not `join!`: a superseded connection loses its `send_tx`, so its
+    // send loop ends, but the recv loop would wait for a close the peer never
+    // sends under keep-alive — one leaked connection per churned link. The active
+    // connection keeps its sender in `PeerState`, so it still exits on the recv
+    // half alone.
     tokio::select! {
         send_res = send_fut => send_res?,
         recv_res = recv_fut => recv_res?,
@@ -1568,18 +1551,9 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Regression test: a [`SendLoop`] must terminate once its send channel is
-    /// closed (all senders dropped), which is how a superseded or disconnected
-    /// connection is signalled — [`PeerState::accept_conn`] drops the old
-    /// connection's `send_tx`, and [`Actor::handle_in_event`] drops it on
-    /// `DisconnectPeer`.
-    ///
-    /// Previously the send loop's `select!` used `Some(msg) = recv()` plus an
-    /// `else => break`. That `else` was dead code: the biased `closed` branch
-    /// stayed enabled-and-pending, so the loop blocked on `closed` forever
-    /// instead of breaking when the channel closed. The connection (and its
-    /// `connection_loop`) then lived until the *peer* closed it — which under
-    /// keep-alive never happened — leaking one connection per churned link.
+    /// A [`SendLoop`] must end once its send channel is closed, which is how a
+    /// superseded connection is signalled. It used to block on `closed` forever
+    /// instead, leaking one connection per churned link.
     ///
     /// [`SendLoop`]: util::SendLoop
     #[tokio::test]
@@ -1591,14 +1565,13 @@ pub(crate) mod tests {
         let ep1 = create_endpoint(rng, relay_map.clone(), None).await?;
         let ep2 = create_endpoint(rng, relay_map.clone(), None).await?;
 
-        // Let ep1 resolve ep2's address.
         let memory_lookup = MemoryLookup::new();
         memory_lookup.add_endpoint_info(EndpointAddr::new(ep2.id()).with_relay_url(relay_url));
         ep1.address_lookup()?.add(memory_lookup);
 
         let ep2_id = ep2.id();
-        // ep2 accepts the connection and holds it open (so the only thing that can
-        // make the send loop exit is the closed send channel, not the peer).
+        // ep2 holds the connection open, so only the closed send channel can end
+        // the send loop.
         let accept_task = task::spawn(async move {
             if let Some(incoming) = ep2.accept().await {
                 if let Ok(conn) = incoming.await {
@@ -1612,13 +1585,11 @@ pub(crate) mod tests {
             .await
             .std_context("connect")?;
 
-        // A send channel whose only sender is immediately dropped models a
-        // just-superseded connection.
+        // A send channel with no sender left models a just-superseded connection.
         let (send_tx, send_rx) = mpsc::channel::<ProtoMessage>(1);
         drop(send_tx);
 
-        // With the fix this returns promptly; with the bug it blocks on
-        // `conn.closed()` forever and the timeout fires.
+        // With the bug this blocks on `conn.closed()` forever and the timeout fires.
         let mut send_loop = util::SendLoop::new(conn, send_rx, 1024);
         let res = timeout(Duration::from_secs(5), send_loop.run(vec![])).await;
         assert!(
@@ -1884,19 +1855,10 @@ pub(crate) mod tests {
     }
 
     /// A `Join` queued behind a failed dial must survive, so an inbound
-    /// connection from that peer can still flush it.
-    ///
-    /// Regression test for the first fix attempt (0ecff17), which removed the
-    /// whole `Pending` entry on dial failure and so discarded the queued
-    /// `Join`. A peer that sends `Join` once and is then connected TO lost that
-    /// `Join` for good and never meshed. `PeerState::accept_conn` is the rescue
-    /// path, and it can only flush a queue that still exists.
-    ///
-    /// `b` joins with no bootstrap peers, so it sends no `Join` of its own:
-    /// the only `Join` in this test is the one `a` queues, which makes the
-    /// queue's survival the single thing under test. hyparview never re-issues
-    /// a `Join` on its own (its timers are `DoShuffle` and
-    /// `PendingNeighborRequest`), so nothing else can form this mesh.
+    /// connection can flush it. The first fix attempt (0ecff17) removed the whole
+    /// `Pending` entry and lost that `Join` for good, and hyparview never
+    /// re-issues one. `b` joins with no bootstrap peers, so the `Join` that `a`
+    /// queued is the only one that can form this mesh.
     #[tokio::test]
     #[traced_test]
     async fn queued_join_survives_failed_dial_for_inbound_flush() -> Result {
@@ -1935,8 +1897,8 @@ pub(crate) mod tests {
         .std_context("wait dial failure")?;
         tracing::info!("a's bootstrap dial failed; b now connects inbound");
 
-        // The rescue path: `b` dials `a`, `a` accepts, and `accept_conn` must
-        // flush the `Join` still queued for `b`.
+        // The rescue path: `b` dials in, and `accept_conn` must flush the `Join`
+        // still queued for `b`.
         let conn = ep_b
             .connect(id_a, GOSSIP_ALPN)
             .await

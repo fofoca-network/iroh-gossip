@@ -47,11 +47,10 @@ derive_more = { version = "2.0.1", features = [
 hex = "0.4.3"
 indexmap = "2.0"
 iroh-metrics = { version = "1.0.1", default-features = false }
-# FORK PIN: fofoca-network/iroh, not crates.io. This crate sits between fofoca
-# and iroh; naming crates.io here put a second iroh in the graph, at which point
-# types crossing the gossip/endpoint boundary stopped unifying (E0308). Only a
-# consumer's [patch.crates-io] could otherwise reconcile it, and that is not
-# inherited across workspaces -- so every consumer had to restate it.
+# FORK PIN: fofoca-network/iroh, not crates.io. Naming crates.io here put a
+# second iroh in the graph, and types crossing the gossip/endpoint boundary
+# stopped unifying (E0308). A consumer's [patch.crates-io] cannot fix that for
+# it: cargo honours one only in a workspace root, and never inherits it.
 iroh-base = { version = "=1.0.3", git = "https://github.com/fofoca-network/iroh", rev = "b7e07872a6d28a9b7971ecfaca8db69c4bddd2de", default-features = false, features = ["key"] }
 n0-future = "0.3"
 postcard = { version = "1", default-features = false, features = [
